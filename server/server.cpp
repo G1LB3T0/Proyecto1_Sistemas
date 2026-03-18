@@ -16,11 +16,11 @@
 #include <chrono>
 #include <ctime>
 #include <iostream>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "../common/framing.h"
@@ -53,13 +53,13 @@ struct ClientInfo {
     time_t           last_activity;
 };
 
-// username → ClientInfo
-static std::map<std::string, ClientInfo> g_users;
-static std::mutex                         g_users_mtx;
+// username → ClientInfo  (unordered_map = O(1) lookup vs O(log n) de map)
+static std::unordered_map<std::string, ClientInfo> g_users;
+static std::mutex                                   g_users_mtx;
 
 // Mutex por socket (evita escrituras simultáneas en el mismo stream TCP)
-static std::map<int, std::shared_ptr<std::mutex>> g_sock_mtxs;
-static std::mutex                                  g_sock_mtxs_lock;
+static std::unordered_map<int, std::shared_ptr<std::mutex>> g_sock_mtxs;
+static std::mutex                                            g_sock_mtxs_lock;
 
 // ─── Helpers para el mutex por socket ────────────────────────────────────────
 
@@ -83,6 +83,13 @@ static bool safe_send(int fd, uint8_t type, const google::protobuf::Message& msg
     auto m = get_send_mtx(fd);
     std::lock_guard<std::mutex> lk(*m);
     return send_message(fd, type, msg);
+}
+
+// Envía bytes ya serializados — para broadcasts (serializar una vez, enviar N veces).
+static bool safe_send_raw(int fd, uint8_t type, const std::string& payload) {
+    auto m = get_send_mtx(fd);
+    std::lock_guard<std::mutex> lk(*m);
+    return send_raw(fd, type, payload);
 }
 
 static void send_response(int fd, int code, const std::string& text, bool ok) {
@@ -139,24 +146,29 @@ static void handle_client(int sockfd, std::string client_ip) {
 
             // ── Tipo 1: Registro ──────────────────────────────────────────────
             case 1: {
+                // Bug fix: rechazar doble registro en la misma conexión
+                if (registered) {
+                    send_response(sockfd, 400, "Already registered as " + username, false);
+                    break;
+                }
+
                 chat::Register reg;
                 if (!reg.ParseFromString(res.payload)) { close(sockfd); return; }
 
+                // Validar username no vacío
+                if (reg.username().empty()) {
+                    send_response(sockfd, 400, "Username cannot be empty", false);
+                    break;
+                }
+
                 bool name_taken = false;
-                bool ip_taken   = false;
                 {
                     std::lock_guard<std::mutex> lk(g_users_mtx);
                     name_taken = g_users.count(reg.username()) > 0;
-                    if (!name_taken) {
-                        for (auto& [u, info] : g_users)
-                            if (info.ip == reg.ip()) { ip_taken = true; break; }
-                    }
                 }
 
                 if (name_taken) {
                     send_response(sockfd, 400, "Username already taken", false);
-                } else if (ip_taken) {
-                    send_response(sockfd, 401, "IP already registered", false);
                 } else {
                     ClientInfo ci;
                     ci.username      = reg.username();
@@ -187,9 +199,11 @@ static void handle_client(int sockfd, std::string client_ip) {
                 bd.set_message(mg.message());
                 bd.set_username_origin(mg.username_origin());
 
-                // Se manda a TODOS, incluyendo al remitente
+                // Serializar UNA sola vez y enviar bytes crudos a todos (no re-serializar por cliente)
+                std::string serialized;
+                bd.SerializeToString(&serialized);
                 for (auto& [fd, u] : snapshot())
-                    safe_send(fd, 13, bd);
+                    safe_send_raw(fd, 13, serialized);
                 break;
             }
 
@@ -331,6 +345,9 @@ int main(int argc, char* argv[]) {
 
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#ifdef SO_NOSIGPIPE
+    setsockopt(server_fd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+#endif
 
     sockaddr_in addr{};
     addr.sin_family      = AF_INET;
@@ -340,7 +357,8 @@ int main(int argc, char* argv[]) {
     if (bind(server_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         perror("bind"); return 1;
     }
-    if (listen(server_fd, 10) < 0) { perror("listen"); return 1; }
+    // Bug fix: backlog 10 rechazaba conexiones con muchos clientes simultáneos
+    if (listen(server_fd, SOMAXCONN) < 0) { perror("listen"); return 1; }
 
     std::cout << "[SERVER] Escuchando en puerto " << port
               << " | timeout de inactividad = " << INACTIVITY_TIMEOUT << "s\n";
@@ -358,6 +376,11 @@ int main(int argc, char* argv[]) {
         std::string client_ip = inet_ntoa(client_addr.sin_addr);
         std::cout << "[SERVER] Nueva conexión desde " << client_ip << "\n";
 
+#ifdef SO_NOSIGPIPE
+        // macOS: evitar SIGPIPE en sockets de clientes
+        int nosig = 1;
+        setsockopt(client_fd, SOL_SOCKET, SO_NOSIGPIPE, &nosig, sizeof(nosig));
+#endif
         // Se crea el mutex antes de lanzar el hilo
         get_send_mtx(client_fd);
 

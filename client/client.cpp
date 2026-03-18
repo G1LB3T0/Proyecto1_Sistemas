@@ -7,7 +7,7 @@
  * Comandos:
  *   <mensaje>                  Envía al chat general
  *   /dm <usuario> <mensaje>    Envía un mensaje directo
- *   /status <ESTADO>           Cambia estado (ACTIVE, DO_NOT_DISTURB, INVISIBLE)
+ *   /status <ESTADO>           Cambia estado (Activo, Ocupado, AFK)
  *   /list                      Lista los usuarios conectados
  *   /info <usuario>            Ver info de un usuario
  *   /help                      Muestra esta ayuda
@@ -20,8 +20,11 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <ctime>
+#include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 
@@ -50,7 +53,31 @@ static int         g_sockfd   = -1;
 static std::string g_username;
 static std::string g_my_ip;
 
+// ─── Colores ANSI ─────────────────────────────────────────────────────────────
+
+#define CLR_RESET   "\033[0m"
+#define CLR_BOLD    "\033[1m"
+#define CLR_DIM     "\033[2m"
+#define CLR_RED     "\033[31m"
+#define CLR_GREEN   "\033[32m"
+#define CLR_YELLOW  "\033[33m"
+#define CLR_BLUE    "\033[34m"
+#define CLR_CYAN    "\033[36m"
+#define CLR_WHITE   "\033[37m"
+#define CLR_BWHITE  "\033[97m"
+
 // ─── Utilidades ───────────────────────────────────────────────────────────────
+
+static std::string timestamp() {
+    time_t now = time(nullptr);
+    struct tm* t = localtime(&now);
+    std::ostringstream ss;
+    ss << CLR_DIM << "["
+       << std::setw(2) << std::setfill('0') << t->tm_hour << ":"
+       << std::setw(2) << std::setfill('0') << t->tm_min
+       << "]" << CLR_RESET;
+    return ss.str();
+}
 
 static void print(const std::string& msg) {
     std::lock_guard<std::mutex> lk(g_print_mtx);
@@ -59,10 +86,19 @@ static void print(const std::string& msg) {
 
 static std::string status_str(chat::StatusEnum s) {
     switch (s) {
-        case chat::ACTIVE:          return "ACTIVE";
-        case chat::DO_NOT_DISTURB:  return "DO_NOT_DISTURB";
-        case chat::INVISIBLE:       return "INVISIBLE";
-        default:                    return "UNKNOWN";
+        case chat::ACTIVE:          return "Activo";
+        case chat::DO_NOT_DISTURB:  return "Ocupado";
+        case chat::INVISIBLE:       return "AFK";
+        default:                    return "Desconocido";
+    }
+}
+
+static std::string status_badge(chat::StatusEnum s) {
+    switch (s) {
+        case chat::ACTIVE:         return CLR_GREEN  "[+]" CLR_RESET;
+        case chat::DO_NOT_DISTURB: return CLR_YELLOW "[-]" CLR_RESET;
+        case chat::INVISIBLE:      return CLR_DIM    "[ ]" CLR_RESET;
+        default:                   return             "[?]";
     }
 }
 
@@ -80,17 +116,28 @@ static std::string local_ip_from_socket(int sockfd) {
     return "0.0.0.0";
 }
 
+static void print_banner() {
+    std::string line(44, '-');
+    print(CLR_BLUE CLR_BOLD
+          "\n  CC3064 Sistemas Operativos -- Chat\n" CLR_RESET
+          CLR_BLUE "  " + line + CLR_RESET "\n"
+          "  Usuario : " CLR_BOLD + g_username + CLR_RESET "\n"
+          "  IP      : " CLR_DIM  + g_my_ip   + CLR_RESET "\n"
+          CLR_BLUE "  " + line + CLR_RESET);
+}
+
 static void print_help() {
-    print(
-        "\n=== Comandos ===\n"
-        "  <mensaje>                  Enviar al chat general\n"
-        "  /dm <usuario> <mensaje>    Mensaje directo\n"
-        "  /status <ESTADO>           ACTIVE | DO_NOT_DISTURB | INVISIBLE\n"
-        "  /list                      Ver usuarios conectados\n"
-        "  /info <usuario>            Ver info de un usuario\n"
-        "  /help                      Mostrar esta ayuda\n"
-        "  /quit                      Salir\n"
-        "================");
+    std::string sep(38, '-');
+    print(CLR_BOLD "\n  Comandos disponibles\n" CLR_RESET
+          "  " + sep + "\n"
+          "  " CLR_YELLOW "<mensaje>" CLR_RESET "              Chat general\n"
+          "  " CLR_YELLOW "/dm <user> <msg>" CLR_RESET "       Mensaje directo\n"
+          "  " CLR_YELLOW "/status <estado>" CLR_RESET "       Activo | Ocupado | AFK\n"
+          "  " CLR_YELLOW "/list" CLR_RESET "                  Ver usuarios conectados\n"
+          "  " CLR_YELLOW "/info <usuario>" CLR_RESET "        Info de un usuario\n"
+          "  " CLR_YELLOW "/help" CLR_RESET "                  Mostrar esta ayuda\n"
+          "  " CLR_YELLOW "/quit" CLR_RESET "                  Salir\n"
+          "  " + sep);
 }
 
 // ─── Hilo receptor ────────────────────────────────────────────────────────────
@@ -99,7 +146,7 @@ static void receiver_thread(int sockfd) {
     while (g_running) {
         RecvResult res = recv_message(sockfd);
         if (!res.ok) {
-            if (g_running) print("[!] Se perdió la conexión con el servidor.");
+            if (g_running) print(CLR_RED "\n  Conexion perdida con el servidor." CLR_RESET);
             g_running = false;
             return;
         }
@@ -108,20 +155,29 @@ static void receiver_thread(int sockfd) {
 
             case 10: { // ServerResponse
                 chat::ServerResponse r;
-                if (r.ParseFromString(res.payload))
-                    print("[SERVER] " + r.message());
+                if (r.ParseFromString(res.payload)) {
+                    std::string color = r.is_successful() ? CLR_GREEN : CLR_RED;
+                    print(timestamp() + " " + color + "* " + r.message() + CLR_RESET);
+                }
                 break;
             }
 
             case 11: { // AllUsers
                 chat::AllUsers au;
                 if (!au.ParseFromString(res.payload)) break;
-                std::string out = "=== Usuarios conectados (" +
-                                  std::to_string(au.usernames_size()) + ") ===";
-                for (int i = 0; i < au.usernames_size(); i++)
-                    out += "\n  " + au.usernames(i) +
-                           " [" + status_str(au.status(i)) + "]";
-                out += "\n========================";
+                std::string sep(30, '-');
+                std::string out = CLR_BOLD "\n  Usuarios conectados (" +
+                                  std::to_string(au.usernames_size()) + ")\n" CLR_RESET
+                                  "  " + sep;
+                for (int i = 0; i < au.usernames_size(); i++) {
+                    std::string name = au.usernames(i);
+                    // pad username to 18 chars for alignment
+                    if (name.size() < 18) name += std::string(18 - name.size(), ' ');
+                    out += "\n  " + status_badge(au.status(i)) + " " +
+                           CLR_BWHITE + name + CLR_RESET +
+                           CLR_DIM + status_str(au.status(i)) + CLR_RESET;
+                }
+                out += "\n  " + sep;
                 print(out);
                 break;
             }
@@ -129,30 +185,36 @@ static void receiver_thread(int sockfd) {
             case 12: { // ForDm — username_des = nombre del remitente
                 chat::ForDm dm;
                 if (dm.ParseFromString(res.payload))
-                    print("[DM de " + dm.username_des() + "]: " + dm.message());
+                    print(timestamp() + CLR_CYAN CLR_BOLD " >> DM de " +
+                          dm.username_des() + ": " CLR_RESET CLR_CYAN +
+                          dm.message() + CLR_RESET);
                 break;
             }
 
             case 13: { // BroadcastDelivery
                 chat::BroadcastDelivery bd;
                 if (bd.ParseFromString(res.payload))
-                    print("[" + bd.username_origin() + "]: " + bd.message());
+                    print(timestamp() + " " CLR_YELLOW CLR_BOLD +
+                          bd.username_origin() + CLR_RESET ": " + bd.message());
                 break;
             }
 
             case 14: { // GetUserInfoResponse
                 chat::GetUserInfoResponse info;
                 if (!info.ParseFromString(res.payload)) break;
-                print("=== Info de usuario ===\n"
-                      "  Usuario: " + info.username() + "\n"
-                      "  IP:      " + info.ip_address() + "\n"
-                      "  Estado:  " + status_str(info.status()) + "\n"
-                      "======================");
+                std::string sep(30, '-');
+                print(CLR_BOLD "\n  Informacion de usuario\n" CLR_RESET
+                      "  " + sep + "\n"
+                      "  Usuario  " CLR_BWHITE + info.username()   + CLR_RESET "\n"
+                      "  IP       " CLR_DIM    + info.ip_address() + CLR_RESET "\n"
+                      "  Estado   " + status_badge(info.status()) + " " + status_str(info.status()) + "\n"
+                      "  " + sep);
                 break;
             }
 
             default:
-                print("[?] Tipo de mensaje desconocido: " + std::to_string(res.type));
+                print(timestamp() + CLR_RED " [?] tipo desconocido: " +
+                      std::to_string(res.type) + CLR_RESET);
         }
     }
 }
@@ -175,6 +237,9 @@ int main(int argc, char* argv[]) {
     // ── Conexión ──────────────────────────────────────────────────────────────
     g_sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (g_sockfd < 0) { perror("socket"); return 1; }
+#ifdef SO_NOSIGPIPE
+    { int nosig = 1; setsockopt(g_sockfd, SOL_SOCKET, SO_NOSIGPIPE, &nosig, sizeof(nosig)); }
+#endif
 
     sockaddr_in server_addr{};
     server_addr.sin_family = AF_INET;
@@ -207,8 +272,7 @@ int main(int argc, char* argv[]) {
         close(g_sockfd); return 1;
     }
 
-    std::cout << "Conectado como " << g_username
-              << " (IP local: " << g_my_ip << ")\n";
+    print_banner();
     print_help();
 
     // ── Hilo receptor ─────────────────────────────────────────────────────────
@@ -242,7 +306,7 @@ int main(int argc, char* argv[]) {
             std::string rest  = line.substr(4);
             size_t      space = rest.find(' ');
             if (space == std::string::npos) {
-                print("Uso: /dm <usuario> <mensaje>");
+                print(CLR_RED "  Uso: /dm <usuario> <mensaje>" CLR_RESET);
                 continue;
             }
             std::string target = rest.substr(0, space);
@@ -257,11 +321,11 @@ int main(int argc, char* argv[]) {
         } else if (line.rfind("/status ", 0) == 0) {
             std::string      s = line.substr(8);
             chat::StatusEnum new_status;
-            if      (s == "ACTIVE")          new_status = chat::ACTIVE;
-            else if (s == "DO_NOT_DISTURB")  new_status = chat::DO_NOT_DISTURB;
-            else if (s == "INVISIBLE")       new_status = chat::INVISIBLE;
+            if      (s == "Activo")   new_status = chat::ACTIVE;
+            else if (s == "Ocupado")  new_status = chat::DO_NOT_DISTURB;
+            else if (s == "AFK")      new_status = chat::INVISIBLE;
             else {
-                print("Estado inválido. Opciones: ACTIVE, DO_NOT_DISTURB, INVISIBLE");
+                print(CLR_RED "  Estado invalido. Opciones: Activo, Ocupado, AFK" CLR_RESET);
                 continue;
             }
             chat::ChangeStatus cs;
@@ -279,7 +343,7 @@ int main(int argc, char* argv[]) {
             client_send(6, gui);
 
         } else if (!line.empty() && line[0] == '/') {
-            print("Comando desconocido. Escribe /help para ver los comandos.");
+            print(CLR_RED "  Comando desconocido. Escribe /help para ver los comandos." CLR_RESET);
 
         } else {
             // Enviar al chat general
