@@ -1,0 +1,23 @@
+# ── Binarios compilados ───────────────────────────────────────────────────────
+chat_server
+chat_client
+
+# ── Archivos generados por protoc ─────────────────────────────────────────────
+generated/
+
+# ── Archivos objeto e intermedios ────────────────────────────────────────────
+*.o
+*.a
+*.so
+*.d
+
+# ── Editores ──────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Sistema operativo ─────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
