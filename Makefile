@@ -32,8 +32,17 @@ PB_SRCS = \
 	$(GEN_DIR)/server-side/server_response.pb.cc
 
 CXX      = g++
-CXXFLAGS = -std=c++17 -Wall -I$(GEN_DIR)
-LDFLAGS  = -lprotobuf -lpthread
+
+# Detect protobuf flags via pkg-config (works on Linux and macOS/Homebrew).
+# Falls back to bare -lprotobuf if pkg-config is unavailable.
+PROTO_CFLAGS := $(shell pkg-config --cflags protobuf 2>/dev/null)
+PROTO_LIBS   := $(shell pkg-config --libs   protobuf 2>/dev/null)
+ifeq ($(PROTO_LIBS),)
+  PROTO_LIBS := -lprotobuf
+endif
+
+CXXFLAGS = -std=c++17 -Wall -I$(GEN_DIR) $(PROTO_CFLAGS)
+LDFLAGS  = $(PROTO_LIBS) -lpthread
 
 .PHONY: all protos chat_server chat_client clean
 
